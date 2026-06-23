@@ -1,8 +1,11 @@
 #include <tuple>
 #include <vector>
+#include <string>
+#include <sstream>
 #include <fstream>
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cmath>
 
 constexpr float pi = 3.14159265358979f;
@@ -21,6 +24,10 @@ struct vec3 {
     float norm() const { return std::sqrt(x*x+y*y+z*z); }
     vec3 normalized() const { return (*this)*(1.f/norm()); }
 };
+
+vec3 cross(const vec3 &a, const vec3 &b) {
+    return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
+}
 
 struct RNG { // xorshift64* — a tiny, fast, decent-quality stream of uniforms in [0,1)
     uint64_t s;
@@ -91,6 +98,147 @@ std::tuple<bool,float> ray_sphere_intersect(const vec3 &orig, const vec3 &dir, c
     return {false, 0};
 }
 
+struct Triangle {
+    vec3 v0, v1, v2;   // vertices
+    vec3 n0, n1, n2;   // per-vertex normals (smooth shading); equal to the face normal for a flat triangle
+    vec3 centroid() const { return (v0+v1+v2)*(1.f/3.f); }
+};
+
+std::tuple<bool,float,float,float> ray_triangle_intersect(const vec3 &orig, const vec3 &dir, const Triangle &tr) { // Moller–Trumbore; ret [hit, dist, barycentric u, v]
+    vec3 e1 = tr.v1 - tr.v0, e2 = tr.v2 - tr.v0;
+    vec3 pvec = cross(dir, e2);
+    float det = e1*pvec;
+    if (std::abs(det) < 1e-9f) return {false, 0, 0, 0};  // ray is parallel to the triangle
+    float inv = 1.f/det;
+    vec3 tvec = orig - tr.v0;
+    float u = (tvec*pvec)*inv;
+    if (u<0 || u>1) return {false, 0, 0, 0};
+    vec3 qvec = cross(tvec, e1);
+    float v = (dir*qvec)*inv;
+    if (v<0 || u+v>1) return {false, 0, 0, 0};
+    float t = (e2*qvec)*inv;
+    if (t < 1e-3f) return {false, 0, 0, 0};
+    return {true, t, u, v};
+}
+
+struct AABB {
+    vec3 lo{ 1e30f,  1e30f,  1e30f};
+    vec3 hi{-1e30f, -1e30f, -1e30f};
+    void grow(const vec3 &p) { for (int k=0;k<3;k++) { lo[k]=std::min(lo[k],p[k]); hi[k]=std::max(hi[k],p[k]); } }
+    void grow(const AABB &b) { grow(b.lo); grow(b.hi); }
+    float area() const { vec3 d = hi-lo; return d.x<0 ? 0.f : 2.f*(d.x*d.y + d.y*d.z + d.z*d.x); }
+    bool hit(const vec3 &orig, const vec3 &invd, float tmax) const { // ray/box slab test on [eps, tmax]
+        float tmin = 1e-3f, tmx = tmax;
+        for (int k=0;k<3;k++) {
+            float t1=(lo[k]-orig[k])*invd[k], t2=(hi[k]-orig[k])*invd[k];
+            if (t1>t2) std::swap(t1,t2);
+            tmin = std::max(tmin,t1); tmx = std::min(tmx,t2);
+        }
+        return tmx >= tmin;
+    }
+};
+
+struct BVHNode {
+    AABB box;
+    int left  = -1;        // left child index (right child is left+1); a leaf has left<0
+    int start = 0, count = 0; // triangle range into BVH::index (leaves only)
+};
+
+// Bounding-volume hierarchy built with a binned Surface Area Heuristic, traversed front-to-back with an explicit stack.
+struct BVH {
+    static constexpr int BINS = 16;
+    std::vector<Triangle> tris;
+    std::vector<int>      index;
+    std::vector<BVHNode>  nodes;
+
+    void build() {
+        index.resize(tris.size());
+        for (size_t i=0;i<tris.size();i++) index[i] = int(i);
+        nodes.clear();
+        nodes.reserve(tris.empty() ? 1 : 2*tris.size()); // a BVH over N leaves has <= 2N-1 nodes -> no reallocation
+        nodes.push_back({});
+        if (!tris.empty()) build_node(0, 0, int(tris.size()));
+    }
+
+    void build_node(int node, int start, int count) {
+        AABB box, cbox;                                  // box bounds the geometry, cbox bounds the centroids
+        for (int i=start;i<start+count;i++) {
+            const Triangle &t = tris[index[i]];
+            box.grow(t.v0); box.grow(t.v1); box.grow(t.v2);
+            cbox.grow(t.centroid());
+        }
+        nodes[node].box = box;
+
+        int best_axis=-1, best_bin=-1;
+        float best_cost = box.area()*count;              // SAH cost of making this node a leaf
+        for (int axis=0; axis<3; axis++) {
+            float lo = cbox.lo[axis], hi = cbox.hi[axis];
+            if (hi-lo < 1e-8f) continue;                 // centroids coincide along this axis — nothing to split
+            float scale = BINS/(hi-lo);
+            AABB bin_box[BINS]; int bin_cnt[BINS] = {0};
+            for (int i=start;i<start+count;i++) {
+                const Triangle &t = tris[index[i]];
+                int b = std::min(BINS-1, int((t.centroid()[axis]-lo)*scale));
+                bin_cnt[b]++;
+                bin_box[b].grow(t.v0); bin_box[b].grow(t.v1); bin_box[b].grow(t.v2);
+            }
+            float suf_area[BINS]; int suf_cnt[BINS];      // suffix sweep: area & count of bins [b..BINS)
+            AABB acc; int cnt=0;
+            for (int b=BINS-1;b>=0;b--) { acc.grow(bin_box[b]); cnt+=bin_cnt[b]; suf_area[b]=acc.area(); suf_cnt[b]=cnt; }
+            AABB lacc; int lcnt=0;                        // prefix sweep: evaluate the SAH cost of every split plane
+            for (int b=0;b<BINS-1;b++) {
+                lacc.grow(bin_box[b]); lcnt+=bin_cnt[b];
+                if (!lcnt || !suf_cnt[b+1]) continue;
+                float cost = lacc.area()*lcnt + suf_area[b+1]*suf_cnt[b+1];
+                if (cost < best_cost) { best_cost=cost; best_axis=axis; best_bin=b; }
+            }
+        }
+
+        if (count<=4 || best_axis<0) {                   // leaf: small range, or no split beats keeping it whole
+            nodes[node].left=-1; nodes[node].start=start; nodes[node].count=count;
+            return;
+        }
+
+        int axis = best_axis;
+        float lo = cbox.lo[axis], scale = BINS/(cbox.hi[axis]-cbox.lo[axis]);
+        auto it = std::partition(index.begin()+start, index.begin()+start+count,
+            [&](int id){ return std::min(BINS-1, int((tris[id].centroid()[axis]-lo)*scale)) <= best_bin; });
+        int mid = int(it - index.begin());
+        if (mid==start || mid==start+count) {            // one-sided split — fall back to a centroid median
+            mid = start + count/2;
+            std::nth_element(index.begin()+start, index.begin()+mid, index.begin()+start+count,
+                [&](int x, int y){ return tris[x].centroid()[axis] < tris[y].centroid()[axis]; });
+        }
+
+        int lc = int(nodes.size());
+        nodes.push_back({}); nodes.push_back({});
+        nodes[node].left = lc; nodes[node].count = 0;
+        build_node(lc,   start, mid-start);
+        build_node(lc+1, mid,   start+count-mid);
+    }
+
+    std::tuple<bool,float,float,float,int> intersect(const vec3 &orig, const vec3 &dir) const { // ret [hit, dist, u, v, triangle index]
+        if (nodes.empty()) return {false, 0, 0, 0, -1};
+        vec3 invd{ 1.f/dir.x, 1.f/dir.y, 1.f/dir.z };
+        float best_t=1e30f, bu=0, bv=0; int best=-1;
+        int stack[64], sp=0; stack[sp++]=0;
+        while (sp) {
+            const BVHNode &nd = nodes[stack[--sp]];
+            if (!nd.box.hit(orig, invd, best_t)) continue;
+            if (nd.left<0) {
+                for (int i=nd.start;i<nd.start+nd.count;i++) {
+                    auto [h,t,u,v] = ray_triangle_intersect(orig, dir, tris[index[i]]);
+                    if (h && t<best_t) { best_t=t; bu=u; bv=v; best=index[i]; }
+                }
+            } else { stack[sp++]=nd.left; stack[sp++]=nd.left+1; }
+        }
+        return { best>=0, best_t, bu, bv, best };
+    }
+};
+
+BVH g_mesh;                                              // the triangle mesh, accelerated by its BVH
+constexpr Material mesh_material = {{1.00, 0.78, 0.36}, 0.18, 1.0, 1.5, 0.0, {0,0,0}}; // polished gold
+
 std::tuple<bool,vec3,vec3,Material> scene_intersect(const vec3 &orig, const vec3 &dir) {
     vec3 pt, N;
     Material material;
@@ -116,6 +264,16 @@ std::tuple<bool,vec3,vec3,Material> scene_intersect(const vec3 &orig, const vec3
         pt = orig + dir*nearest_dist;
         N = (pt - s.center).normalized();
         material = s.material;
+    }
+
+    auto [mhit, md, mu, mv, mi] = g_mesh.intersect(orig, dir); // intersect the triangle mesh through its BVH
+    if (mhit && md < nearest_dist) {
+        nearest_dist = md;
+        pt = orig + dir*md;
+        const Triangle &tr = g_mesh.tris[mi];
+        vec3 n = tr.n0*(1-mu-mv) + tr.n1*mu + tr.n2*mv;  // barycentric-interpolated smooth normal
+        N = (n.norm()>1e-6f ? n : cross(tr.v1-tr.v0, tr.v2-tr.v0)).normalized();
+        material = mesh_material;
     }
     return { nearest_dist<1000, pt, N, material };
 }
@@ -251,7 +409,71 @@ vec3 path_trace(vec3 orig, vec3 dir, RNG &rng) {
     return radiance;
 }
 
-int main() {
+std::vector<Triangle> load_obj(const std::string &path) { // minimal Wavefront OBJ reader: v / vn / f, polygons triangulated as fans
+    std::ifstream in(path);
+    std::vector<vec3> verts, norms;
+    std::vector<Triangle> tris;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream ss(line);
+        std::string tag; ss >> tag;
+        if (tag=="v")  { vec3 p; ss>>p.x>>p.y>>p.z; verts.push_back(p); }
+        else if (tag=="vn") { vec3 n; ss>>n.x>>n.y>>n.z; norms.push_back(n); }
+        else if (tag=="f")  {
+            std::vector<int> vi, ni;
+            std::string tok;
+            while (ss >> tok) {                          // each token is v, v/vt, v//vn or v/vt/vn
+                int v=0, vn=0;
+                size_t s1 = tok.find('/');
+                if (s1==std::string::npos) v = std::stoi(tok);
+                else {
+                    v = std::stoi(tok.substr(0,s1));
+                    size_t s2 = tok.find('/', s1+1);
+                    if (s2!=std::string::npos && s2+1<tok.size()) vn = std::stoi(tok.substr(s2+1));
+                }
+                vi.push_back(v <0 ? int(verts.size())+v : v -1); // OBJ is 1-based; negative indices are relative
+                ni.push_back(vn==0 ? -1 : (vn<0 ? int(norms.size())+vn : vn-1));
+            }
+            for (size_t k=1; k+1<vi.size(); k++) {       // fan-triangulate the face
+                Triangle t;
+                t.v0=verts[vi[0]]; t.v1=verts[vi[k]]; t.v2=verts[vi[k+1]];
+                vec3 gn = cross(t.v1-t.v0, t.v2-t.v0).normalized();
+                t.n0 = ni[0]  >=0 ? norms[ni[0]]  : gn;
+                t.n1 = ni[k]  >=0 ? norms[ni[k]]  : gn;
+                t.n2 = ni[k+1]>=0 ? norms[ni[k+1]]: gn;
+                tris.push_back(t);
+            }
+        }
+    }
+    return tris;
+}
+
+std::vector<Triangle> make_torus(int nu, int nv, float R, float r, vec3 center, float tilt) { // procedural torus with exact vertex normals
+    auto rotx = [tilt](vec3 p){ float c=std::cos(tilt), s=std::sin(tilt); return vec3{p.x, p.y*c-p.z*s, p.y*s+p.z*c}; };
+    auto vert = [&](int i, int j, vec3 &P, vec3 &N) {
+        float u = 2*pi*i/nu, v = 2*pi*j/nv;
+        N = rotx({std::cos(v)*std::cos(u), std::sin(v), std::cos(v)*std::sin(u)});
+        P = rotx({(R+r*std::cos(v))*std::cos(u), r*std::sin(v), (R+r*std::cos(v))*std::sin(u)}) + center;
+    };
+    std::vector<Triangle> tris;
+    tris.reserve(size_t(nu)*nv*2);
+    for (int i=0;i<nu;i++)
+        for (int j=0;j<nv;j++) {
+            vec3 p00,n00,p10,n10,p01,n01,p11,n11;
+            vert(i,         j,         p00,n00); vert((i+1)%nu, j,         p10,n10);
+            vert(i,         (j+1)%nv,  p01,n01); vert((i+1)%nu, (j+1)%nv,  p11,n11);
+            tris.push_back({p00,p10,p11, n00,n10,n11});  // two triangles per quad of the (u,v) grid
+            tris.push_back({p00,p11,p01, n00,n11,n01});
+        }
+    return tris;
+}
+
+int main(int argc, char **argv) {
+    g_mesh.tris = argc>1 ? load_obj(argv[1])             // render an external model if given,
+                         : make_torus(220, 90, 2.3f, 0.8f, {-3.6f, 1.7f, -10.f}, -1.0f); // otherwise a procedural torus
+    g_mesh.build();
+    std::fprintf(stderr, "mesh: %zu triangles, BVH: %zu nodes\n", g_mesh.tris.size(), g_mesh.nodes.size());
+
     constexpr int   width  = 1024;
     constexpr int   height = 768;
     constexpr int   spp    = 64;     // Monte-Carlo samples per pixel (also gives free anti-aliasing)
