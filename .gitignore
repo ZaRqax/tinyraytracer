@@ -1,3 +1,6 @@
 # Ignore content built with CMake
 build/
 
+# Raw renderer output (the committed showcase is out.jpg)
+out.ppm
+
